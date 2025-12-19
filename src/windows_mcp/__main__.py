@@ -254,7 +254,7 @@ def wait_tool(duration:int)->str:
 
 @mcp.tool(
     name='Scrape-Tool',
-    description='Extracts visible text content from the currently focused browser tab. Returns content in plain text format with scroll status indicators (top/bottom reached or more content available). Only works when a browser with DOM is active. Use State-Tool with use_dom=True first to ensure browser is ready.',
+    description='Fetch content from a URL or the active browser tab. By default (use_dom=False), performs a lightweight HTTP request to the URL and returns markdown content of complete webpage. Note: Some websites may block automated HTTP requests. If this fails, open the page in a browser and retry with use_dom=True to extract visible text from the active tab\'s DOM within the viewport.',
     annotations=ToolAnnotations(
         title="Scrape Tool",
         readOnlyHint=True,
@@ -264,8 +264,12 @@ def wait_tool(duration:int)->str:
     )
     )
 @with_analytics(analytics, "Scrape-Tool")
-def scrape_tool(url:str)->str:
-    desktop_state=desktop.desktop_state
+def scrape_tool(url:str,use_dom:bool=False)->str:
+    if not use_dom:
+        content=desktop.scrape(url)
+        return f'URL:{url}\nContent:\n{content}'
+
+    desktop_state=desktop.get_state(use_vision=False,use_dom=use_dom)
     tree_state=desktop_state.tree_state
     if not tree_state.dom_info:
         return f'No DOM information found. Please open {url} in browser first.'
@@ -274,7 +278,7 @@ def scrape_tool(url:str)->str:
     content='\n'.join([node.text for node in tree_state.dom_informative_nodes])
     header_status = "Reached top" if vertical_scroll_percent <= 0 else "Scroll up to see more"
     footer_status = "Reached bottom" if vertical_scroll_percent >= 100 else "Scroll down to see more"
-    return f'URL:{url}\nContent:\n{header_status}\n{content}\n{footer_status}'
+    return f'URL:{url}\nContent:\n[{header_status}]\n{content}\n[{footer_status}]'
 
 
 @click.command()
