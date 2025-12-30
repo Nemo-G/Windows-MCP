@@ -1,5 +1,4 @@
 from windows_mcp.analytics import PostHogAnalytics, with_analytics
-from live_inspect.watch_cursor import WatchCursor
 from windows_mcp.desktop.service import Desktop
 from contextlib import asynccontextmanager
 from fastmcp.utilities.types import Image
@@ -13,15 +12,49 @@ import pyautogui as pg
 import asyncio
 import click
 import os
+import logging
+import time
+
+try:
+    from live_inspect.watch_cursor import WatchCursor  # type: ignore
+except Exception:
+    WatchCursor = None  # type: ignore
 
 load_dotenv()
 
 pg.FAILSAFE=False
 pg.PAUSE=1.0
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[%(levelname)s] %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.propagate = False
+
+# Reduce extremely noisy dependency logs (FastMCP internal scheduler, fakeredis, etc.)
+# while keeping our State-Tool timing logs.
+_dep_level_name = os.getenv("WINDOWS_MCP_DEP_LOG_LEVEL", "WARNING").upper()
+_dep_level = getattr(logging, _dep_level_name, logging.WARNING)
+for _name in [
+    "fakeredis",
+    "docket",
+    "docket.worker",
+    "mcp",
+    "mcp.server",
+    "mcp.server.lowlevel.server",
+    "mcp.server.streamable_http_manager",
+    "posthog",
+    "comtypes",
+    "asyncio",
+]:
+    logging.getLogger(_name).setLevel(_dep_level)
+
 desktop=Desktop()
 cursor=SystemCursor()
-watch_cursor=WatchCursor()
+watch_cursor = WatchCursor() if WatchCursor else None
 windows_version=desktop.get_windows_version()
 default_language=desktop.get_default_language()
 screen_width,screen_height=desktop.get_resolution()
@@ -41,11 +74,13 @@ else:
 async def lifespan(app: FastMCP):
     """Runs initialization code before the server starts and cleanup code after it shuts down."""
     try:
-        watch_cursor.start()
+        if watch_cursor:
+            watch_cursor.start()
         await asyncio.sleep(1) # Simulate startup latency
         yield
     finally:
-        watch_cursor.stop()
+        if watch_cursor:
+            watch_cursor.stop()
         if analytics:
             await analytics.close()
 
@@ -95,6 +130,8 @@ def powershell_tool(command: str, ctx: Context = None) -> str:
     )
 @with_analytics(analytics, "State-Tool")
 def state_tool(use_vision:bool=False,use_dom:bool=False, ctx: Context = None):
+    t0 = time.perf_counter()
+    logger.info("State-Tool: begin use_dom=%s use_vision=%s", use_dom, use_vision)
     # Calculate scale factor to cap resolution at 1080p (1920x1080)
     max_width, max_height = 1920, 1080
     scale_width = max_width / screen_width if screen_width > max_width else 1.0
@@ -102,10 +139,22 @@ def state_tool(use_vision:bool=False,use_dom:bool=False, ctx: Context = None):
     scale = min(scale_width, scale_height)  # Use the smaller scale to ensure both dimensions fit
     
     desktop_state=desktop.get_state(use_vision=use_vision,use_dom=use_dom,as_bytes=True,scale=scale)
+    t_state = time.perf_counter()
     interactive_elements=desktop_state.tree_state.interactive_elements_to_string()
     scrollable_elements=desktop_state.tree_state.scrollable_elements_to_string()
     apps=desktop_state.apps_to_string()
     active_app=desktop_state.active_app_to_string()
+    warnings = ""
+    if getattr(desktop_state.tree_state, "warnings", None):
+        warnings_list = "\n".join([f"- {w}" for w in desktop_state.tree_state.warnings])
+        warnings = f"\nState Collection Warnings:\n{warnings_list}\n"
+    logger.info(
+        "State-Tool: end state=%.3fs total=%.3fs partial=%s warnings=%d",
+        (t_state - t0),
+        (time.perf_counter() - t0),
+        getattr(desktop_state.tree_state, "is_partial", False),
+        len(getattr(desktop_state.tree_state, "warnings", []) or []),
+    )
     return [dedent(f'''
     Default Language of User:
     {default_language} with encoding: {desktop.encoding}
@@ -115,6 +164,7 @@ def state_tool(use_vision:bool=False,use_dom:bool=False, ctx: Context = None):
 
     Opened Apps:
     {apps}
+    {warnings}
 
     List of Interactive Elements:
     {interactive_elements or 'No interactive elements found.'}

@@ -1,14 +1,29 @@
-from windows_mcp.tree.config import INTERACTIVE_CONTROL_TYPE_NAMES,DOCUMENT_CONTROL_TYPE_NAMES,INFORMATIVE_CONTROL_TYPE_NAMES, DEFAULT_ACTIONS, THREAD_MAX_RETRIES
+from windows_mcp.tree.config import (
+    INTERACTIVE_CONTROL_TYPE_NAMES,
+    DOCUMENT_CONTROL_TYPE_NAMES,
+    INFORMATIVE_CONTROL_TYPE_NAMES,
+    DEFAULT_ACTIONS,
+    THREAD_MAX_RETRIES,
+    TREE_STATE_TIMEOUT_S,
+    TREE_STATE_TIMEOUT_DOM_S,
+    ROOT_ENUM_TIMEOUT_S,
+    UIA_TIMEOUT_COOLDOWN_S,
+    UIA_MAX_WORKERS,
+)
 from windows_mcp.tree.views import TreeElementNode, ScrollElementNode, TextElementNode, Center, BoundingBox, TreeState, DOMInfo
 from uiautomation import Control,ImageControl,ScrollPattern,WindowControl,Rect,GetRootControl,PatternId
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from windows_mcp.tree.utils import random_point_within_bounding_box
 from PIL import Image, ImageFont, ImageDraw
 from typing import TYPE_CHECKING,Optional
 from windows_mcp.desktop.views import App
+from windows_mcp.desktop.config import EXCLUDED_APPS
 from time import sleep
+import time
 import logging
 import random
+import os
+import uiautomation as uia
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -19,6 +34,19 @@ logger.addHandler(handler)
 
 if TYPE_CHECKING:
     from windows_mcp.desktop.service import Desktop
+
+
+def _init_uia_in_worker_thread() -> None:
+    """
+    UIAutomation (COM) must be initialized per thread when using `uiautomation`
+    from a ThreadPoolExecutor. Without this, calls may fail with:
+      [WinError -2147221008] CoInitialize has not been called
+    """
+    try:
+        uia.InitializeUIAutomationInCurrentThread()
+    except Exception as e:
+        # Don't hard-fail the worker thread; the caller will surface partial results.
+        logger.debug(f"UIAutomation init in worker thread failed: {e}")
     
 class Tree:
     def __init__(self,desktop:'Desktop'):
@@ -26,53 +54,191 @@ class Tree:
         self.screen_size=self.desktop.get_screen_size()
         self.dom_info:Optional[DOMInfo]=None
         self.dom_bounding_box:BoundingBox=None
+        # Persistent executor to avoid hanging on shutdown when any UIA traversal thread blocks.
+        self._executor = ThreadPoolExecutor(
+            max_workers=UIA_MAX_WORKERS,
+            thread_name_prefix="windows-mcp-uia",
+            initializer=_init_uia_in_worker_thread,
+        )
+        # If UIAutomation gets into a bad state (common when a provider hangs), we temporarily
+        # disable UIA enumeration to avoid leaking stuck threads on repeated calls.
+        self._uia_disabled_until: float = 0.0
         self.screen_box=BoundingBox(
             top=0, left=0, bottom=self.screen_size.height, right=self.screen_size.width,
             width=self.screen_size.width, height=self.screen_size.height 
         )
 
     def get_state(self,active_app:App,other_apps:list[App],use_dom:bool=False)->TreeState:
-        root=GetRootControl()
-        other_apps_handle=set(map(lambda other_app: other_app.handle,other_apps))
-        apps=list(filter(lambda app:app.NativeWindowHandle not in other_apps_handle,root.GetChildren()))
-        del other_apps_handle
-        if active_app:
-            apps=list(filter(lambda app:app.ClassName!='Progman',apps))
-        interactive_nodes,scrollable_nodes,dom_informative_nodes=self.get_appwise_nodes(apps=apps,use_dom=use_dom)
-        return TreeState(dom_info=self.dom_info,interactive_nodes=interactive_nodes,scrollable_nodes=scrollable_nodes,dom_informative_nodes=dom_informative_nodes)
+        t0 = time.perf_counter()
+        timeout_s = TREE_STATE_TIMEOUT_DOM_S if use_dom else TREE_STATE_TIMEOUT_S
+        root_timeout_s = min(ROOT_ENUM_TIMEOUT_S, timeout_s)
 
-    def get_appwise_nodes(self,apps:list[Control],use_dom:bool=False)-> tuple[list[TreeElementNode],list[ScrollElementNode],list[TextElementNode]]:
+        now = time.monotonic()
+        if now < self._uia_disabled_until:
+            remaining = self._uia_disabled_until - now
+            warnings = [
+                f"UIAutomation enumeration temporarily disabled for {remaining:.1f}s after a prior timeout; returning partial results."
+            ]
+            logger.warning("State-Tool(Tree): UIA disabled (%.1fs remaining), returning partial.", remaining)
+            return TreeState(
+                dom_info=None,
+                interactive_nodes=[],
+                scrollable_nodes=[],
+                dom_informative_nodes=[],
+                is_partial=True,
+                warnings=warnings,
+            )
+
+        other_apps_handle=set(map(lambda other_app: other_app.handle,other_apps))
+        exclude_system_windows = os.getenv("WINDOWS_MCP_EXCLUDE_SYSTEM_WINDOWS", "false").strip().lower() in {
+            "1", "true", "yes", "y"
+        }
+
+        root_warnings: list[str] = []
+        root_partial = False
+
+        def collect_targets() -> list[Control]:
+            root = GetRootControl()
+            children = root.GetChildren()
+            targets: list[Control] = []
+            for child in children:
+                try:
+                    hwnd = child.NativeWindowHandle
+                except Exception:
+                    continue
+                if hwnd in other_apps_handle:
+                    continue
+                if active_app and child.ClassName == "Progman":
+                    # Keep the desktop out of the listing when an active app exists (matches previous behavior).
+                    continue
+                if exclude_system_windows and child.ClassName in EXCLUDED_APPS:
+                    continue
+                targets.append(child)
+            return targets
+
+        apps: list[Control] = []
+        try:
+            fut = self._executor.submit(collect_targets)
+            apps = fut.result(timeout=root_timeout_s)
+        except FuturesTimeoutError:
+            root_partial = True
+            root_warnings.append(
+                f"Root UIAutomation enumeration timed out after {root_timeout_s:.1f}s; falling back to active window only."
+            )
+            self._uia_disabled_until = max(self._uia_disabled_until, time.monotonic() + UIA_TIMEOUT_COOLDOWN_S)
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+        except Exception as e:
+            root_partial = True
+            root_warnings.append("Root UIAutomation enumeration failed; falling back to active window only.")
+            logger.debug(f"Root enumeration error: {e}")
+
+        # Fallback: at least enumerate the active app if root enumeration is unavailable.
+        if not apps and active_app and active_app.handle:
+            try:
+                fut = self._executor.submit(lambda: uia.ControlFromHandle(active_app.handle))
+                apps = [fut.result(timeout=min(1.0, root_timeout_s))]
+            except Exception:
+                root_partial = True
+                root_warnings.append("Active window UIAutomation handle lookup failed; returning partial state.")
+
+        t_root = time.perf_counter()
+        logger.info(
+            "State-Tool(Tree): targets=%d root=%.3fs use_dom=%s root_partial=%s",
+            len(apps),
+            (t_root - t0),
+            use_dom,
+            root_partial,
+        )
+
+        interactive_nodes,scrollable_nodes,dom_informative_nodes,is_partial,warnings=self.get_appwise_nodes(apps=apps,use_dom=use_dom)
+        is_partial = bool(is_partial or root_partial)
+        warnings = (warnings or []) + root_warnings
+        t_end = time.perf_counter()
+        logger.info(
+            "State-Tool(Tree): done total=%.3fs interactive=%d scroll=%d partial=%s",
+            (t_end - t0),
+            len(interactive_nodes),
+            len(scrollable_nodes),
+            is_partial,
+        )
+        return TreeState(
+            dom_info=self.dom_info,
+            interactive_nodes=interactive_nodes,
+            scrollable_nodes=scrollable_nodes,
+            dom_informative_nodes=dom_informative_nodes,
+            is_partial=is_partial,
+            warnings=warnings,
+        )
+
+    def get_appwise_nodes(self,apps:list[Control],use_dom:bool=False)-> tuple[list[TreeElementNode],list[ScrollElementNode],list[TextElementNode],bool,list[str]]:
         interactive_nodes, scrollable_nodes,dom_informative_nodes = [], [], []
-        with ThreadPoolExecutor() as executor:
-            retry_counts = {app: 0 for app in apps}
-            future_to_app = {
-                executor.submit(
-                    self.get_nodes, app, 
-                    self.desktop.is_app_browser(app),
-                    use_dom
-                ): app 
-                for app in apps
-            }
-            while future_to_app:  # keep running until no pending futures
-                for future in as_completed(list(future_to_app)):
-                    app = future_to_app.pop(future)  # remove completed future
+        is_partial = False
+        warnings: list[str] = []
+
+        timeout_s = TREE_STATE_TIMEOUT_DOM_S if use_dom else TREE_STATE_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
+
+        retry_counts = {app: 0 for app in apps}
+        future_to_app = {
+            # Determine browser-ness inside the worker thread to avoid blocking on UIA properties here.
+            self._executor.submit(self.get_nodes, app, None, use_dom): app
+            for app in apps
+        }
+        total_submitted = len(future_to_app)
+        completed = 0
+
+        while future_to_app:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                is_partial = True
+                warnings.append(f"UI tree enumeration timed out after {timeout_s:.1f}s; returning partial results.")
+                break
+            try:
+                for future in as_completed(list(future_to_app), timeout=remaining):
+                    app = future_to_app.pop(future)
                     try:
                         result = future.result()
                         if result:
-                            element_nodes, scroll_nodes,informative_nodes = result
+                            element_nodes, scroll_nodes, informative_nodes = result
                             interactive_nodes.extend(element_nodes)
                             scrollable_nodes.extend(scroll_nodes)
                             dom_informative_nodes.extend(informative_nodes)
+                        completed += 1
                     except Exception as e:
                         retry_counts[app] += 1
-                        logger.debug(f"Error in processing node {app.Name}, retry attempt {retry_counts[app]}\nError: {e}")
-                        if retry_counts[app] < THREAD_MAX_RETRIES:
-                            logger.debug(f"Retrying {app.Name} for the {retry_counts[app]}th time")
-                            new_future = executor.submit(self.get_nodes, app, self.desktop.is_app_browser(app),use_dom)
+                        # Avoid touching UIA properties here (e.g. app.Name) — they can block too.
+                        logger.debug(f"Error in processing UIA subtree (retry {retry_counts[app]}/{THREAD_MAX_RETRIES}): {e}")
+                        if retry_counts[app] < THREAD_MAX_RETRIES and (deadline - time.monotonic()) > 0:
+                            new_future = self._executor.submit(
+                                self.get_nodes, app, None, use_dom
+                            )
                             future_to_app[new_future] = app
                         else:
-                            logger.error(f"Task failed completely for {app.Name} after {THREAD_MAX_RETRIES} retries")
-        return interactive_nodes,scrollable_nodes,dom_informative_nodes
+                            is_partial = True
+                            warnings.append("Some UIA subtrees failed; returning partial results.")
+            except FuturesTimeoutError:
+                is_partial = True
+                warnings.append(f"UI tree enumeration timed out after {timeout_s:.1f}s; returning partial results.")
+                break
+
+        # Best-effort: cancel pending work (won't stop running threads, but avoids queue buildup).
+        for fut in list(future_to_app):
+            fut.cancel()
+
+        if is_partial:
+            logger.info(
+                "State-Tool(Tree): subtree_partial=%s completed=%d/%d nodes=%d scroll=%d",
+                is_partial,
+                completed,
+                total_submitted,
+                len(interactive_nodes),
+                len(scrollable_nodes),
+            )
+
+        return interactive_nodes, scrollable_nodes, dom_informative_nodes, is_partial, warnings
     
     def iou_bounding_box(self,window_box: Rect,element_box: Rect,) -> BoundingBox:
         # Step 1: Intersection of element and window (existing logic)
@@ -109,7 +275,12 @@ class Tree:
             )
         return bounding_box
 
-    def get_nodes(self, node: Control, is_browser:bool=False,use_dom:bool=False) -> tuple[list[TreeElementNode],list[ScrollElementNode]]:
+    def get_nodes(self, node: Control, is_browser:bool|None=None, use_dom:bool=False) -> tuple[list[TreeElementNode],list[ScrollElementNode]]:
+        if is_browser is None:
+            try:
+                is_browser = self.desktop.is_app_browser(node)
+            except Exception:
+                is_browser = False
         window_bounding_box=node.BoundingRectangle
 
         def is_element_visible(node:Control,threshold:int=0):

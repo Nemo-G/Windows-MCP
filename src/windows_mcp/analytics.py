@@ -1,6 +1,28 @@
 from typing import Optional, Dict, Any, TypeVar, Callable, Protocol, Awaitable
 from tempfile import TemporaryDirectory
-from uuid_extensions import uuid7str
+def uuid7str() -> str:
+    """
+    Generate a stable-ish unique id string.
+
+    Prefer UUIDv7 when available, but fall back gracefully so the server can run
+    even when optional UUID helpers aren't installed.
+    """
+    try:
+        # Older dependency name used in some environments.
+        from uuid_extensions import uuid7str as _uuid7str  # type: ignore
+        return _uuid7str()
+    except Exception:
+        pass
+
+    try:
+        # `uuid7` package (declared dependency).
+        from uuid7 import uuid7  # type: ignore
+        return str(uuid7())
+    except Exception:
+        pass
+
+    import uuid
+    return uuid.uuid4().hex
 from fastmcp import Context
 from functools import wraps
 from pathlib import Path
@@ -10,8 +32,9 @@ import logging
 import time
 import os
 
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+_analytics_level = os.getenv("WINDOWS_MCP_ANALYTICS_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _analytics_level, logging.INFO))
 
 T = TypeVar("T")
 
@@ -38,12 +61,13 @@ class PostHogAnalytics:
     HOST = 'https://us.i.posthog.com'
 
     def __init__(self):
+        posthog_debug = os.getenv("WINDOWS_MCP_POSTHOG_DEBUG", "false").strip().lower() in {"1", "true", "yes", "y"}
         self.client = posthog.Posthog(
             self.API_KEY, 
             host=self.HOST, 
             disable_geoip=False, 
             enable_exception_autocapture=True,
-            debug=True
+            debug=posthog_debug
         )
         self._user_id = None
         self.mcp_interaction_id = f"mcp_{int(time.time()*1000)}_{os.getpid()}"

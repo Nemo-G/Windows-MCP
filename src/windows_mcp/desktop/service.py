@@ -21,6 +21,7 @@ import csv
 import re
 import os
 import io
+import time
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -36,6 +37,7 @@ except Exception:
 
 import uiautomation as uia
 import pyautogui as pg
+import time
 
 pg.FAILSAFE=False
 pg.PAUSE=1.0
@@ -45,19 +47,36 @@ class Desktop:
         self.encoding=getpreferredencoding()
         self.tree=Tree(self)
         self.desktop_state=None
+        # Ensure UIAutomation COM is initialized in the main thread too (some APIs depend on it).
+        try:
+            uia.InitializeUIAutomationInCurrentThread()
+        except Exception:
+            pass
         
     def get_resolution(self)->tuple[int,int]:
         return pg.size()
         
     def get_state(self,use_vision:bool=False,use_dom:bool=False,as_bytes:bool=False,scale:float=1.0)->DesktopState:
         sleep(0.1)
+        t0 = time.perf_counter()
         apps=self.get_apps()
+        t_apps = time.perf_counter()
         active_app=self.get_active_app()
-        if active_app is not None and active_app in apps:
-            apps.remove(active_app)
-        logger.debug(f"Active app: {active_app}")
-        logger.debug(f"Apps: {apps}")
+        t_active = time.perf_counter()
+        if active_app is not None:
+            # Remove active app by handle (depth/name may differ, so dataclass equality is unreliable here).
+            apps = [app for app in apps if app.handle != active_app.handle]
+        logger.info(
+            "State-Tool: apps=%d (%.3fs), active=%s (%.3fs), use_dom=%s, use_vision=%s",
+            len(apps),
+            (t_apps - t0),
+            (active_app.name if active_app else "None"),
+            (t_active - t_apps),
+            use_dom,
+            use_vision,
+        )
         tree_state=self.tree.get_state(active_app,apps,use_dom=use_dom)
+        t_tree = time.perf_counter()
         if use_vision:
             screenshot=self.tree.get_annotated_screenshot(tree_state.interactive_nodes,scale=scale)
             if as_bytes:
@@ -66,6 +85,15 @@ class Desktop:
                 screenshot=bytes_io.getvalue()
         else:
             screenshot=None
+        t_end = time.perf_counter()
+        logger.info(
+            "State-Tool: tree_nodes=%d scroll=%d partial=%s tree=%.3fs total=%.3fs",
+            len(tree_state.interactive_nodes),
+            len(tree_state.scrollable_nodes),
+            getattr(tree_state, "is_partial", False),
+            (t_tree - t_active),
+            (t_end - t0),
+        )
         self.desktop_state=DesktopState(apps= apps,active_app=active_app,screenshot=screenshot,tree_state=tree_state)
         return self.desktop_state
     
@@ -78,11 +106,39 @@ class Desktop:
     
     def get_active_app(self)->App|None:
         try:
-            handle=uia.GetForegroundWindow()
-            for app in self.get_apps():
-                if app.handle!=handle:
-                    continue
-                return app
+            handle = win32gui.GetForegroundWindow()
+            if not handle:
+                return None
+            name = (win32gui.GetWindowText(handle) or "").strip() or "Foreground Window"
+            left, top, right, bottom = win32gui.GetWindowRect(handle)
+            width, height = max(0, right - left), max(0, bottom - top)
+            _, pid = win32process.GetWindowThreadProcessId(handle)
+            is_min = bool(win32gui.IsIconic(handle))
+            if hasattr(win32gui, "IsZoomed"):
+                is_max = bool(win32gui.IsZoomed(handle))  # type: ignore[attr-defined]
+            else:
+                # Fallback for environments where win32gui lacks IsZoomed()
+                try:
+                    # (flags, showCmd, ptMinPosition, ptMaxPosition, rect)
+                    show_cmd = win32gui.GetWindowPlacement(handle)[1]
+                    is_max = show_cmd == win32con.SW_SHOWMAXIMIZED
+                except Exception:
+                    is_max = False
+            is_visible = bool(win32gui.IsWindowVisible(handle))
+            status = (
+                Status.MINIMIZED if is_min
+                else Status.MAXIMIZED if is_max
+                else Status.NORMAL if is_visible
+                else Status.HIDDEN
+            )
+            return App(
+                name=name,
+                depth=0,
+                status=status,
+                size=Size(width=width, height=height),
+                handle=handle,
+                process_id=pid,
+            )
         except Exception as ex:
             logger.error(f"Error in get_active_app: {ex}")
         return None
@@ -217,27 +273,95 @@ class Desktop:
         app=apps.get(app_name)
         target_handle=app.handle
 
-        if uia.IsIconic(target_handle):
-            uia.ShowWindow(target_handle, win32con.SW_RESTORE)
-            content=f'{app_name.title()} restored from Minimized state.'
-        else:
-            self.bring_window_to_top(target_handle)
-            content=f'Switched to {app_name.title()} window.'
+        # Always attempt a full activation sequence. Restoring alone can bring a window
+        # on-screen without giving it keyboard focus.
+        if win32gui.IsIconic(target_handle):
+            try:
+                win32gui.ShowWindow(target_handle, win32con.SW_RESTORE)
+            except Exception:
+                # fall back to uiautomation wrapper if needed
+                try:
+                    uia.ShowWindow(target_handle, win32con.SW_RESTORE)
+                except Exception:
+                    pass
+        self.bring_window_to_top(target_handle)
+        content=f'Switched to {app_name.title()} window.'
         return content,0
     
     def bring_window_to_top(self,target_handle:int):
+        """
+        Best-effort "activate + focus" for a top-level window.
+
+        Notes:
+        - Windows actively prevents background processes from stealing focus.
+        - `BringWindowToTop` only adjusts Z-order; it doesn't guarantee keyboard focus.
+        - We attach input threads to improve the odds that `SetForegroundWindow` succeeds.
+        """
         foreground_handle=win32gui.GetForegroundWindow()
         foreground_thread,_=win32process.GetWindowThreadProcessId(foreground_handle)
         target_thread,_=win32process.GetWindowThreadProcessId(target_handle)
+        current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
         try:
             ctypes.windll.user32.AllowSetForegroundWindow(-1)
-            win32process.AttachThreadInput(foreground_thread,target_thread,True)
+            # Attach our thread to both the foreground and target threads.
+            try:
+                win32process.AttachThreadInput(current_thread, foreground_thread, True)
+            except Exception:
+                pass
+            try:
+                win32process.AttachThreadInput(current_thread, target_thread, True)
+            except Exception:
+                pass
+
+            # Ensure the window is shown (SW_SHOW is a no-op if already visible).
+            try:
+                win32gui.ShowWindow(target_handle, win32con.SW_SHOW)
+            except Exception:
+                pass
+
+            # Try to foreground + focus.
             win32gui.SetForegroundWindow(target_handle)
-            win32gui.BringWindowToTop(target_handle)
+            try:
+                win32gui.SetActiveWindow(target_handle)
+            except Exception:
+                pass
+            try:
+                win32gui.SetFocus(target_handle)
+            except Exception:
+                pass
+            try:
+                win32gui.BringWindowToTop(target_handle)
+            except Exception:
+                pass
+
+            # Extra nudge: try UIAutomation focus on the window element.
+            try:
+                uia.ControlFromHandle(target_handle).SetFocus()
+            except Exception:
+                pass
+
+            # Optional last resort: click the title bar to force focus (off by default).
+            if os.getenv("WINDOWS_MCP_FORCE_FOCUS_CLICK", "false").strip().lower() in {"1", "true", "yes", "y"}:
+                try:
+                    if win32gui.GetForegroundWindow() != target_handle:
+                        left, top, right, bottom = win32gui.GetWindowRect(target_handle)
+                        x = int((left + right) / 2)
+                        y = int(top + 12)
+                        pg.click(x, y, clicks=1, duration=0.05)
+                        time.sleep(0.05)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f'Failed to bring window to top: {e}')
         finally:
-            win32process.AttachThreadInput(foreground_thread,target_thread,False)
+            try:
+                win32process.AttachThreadInput(current_thread, target_thread, False)
+            except Exception:
+                pass
+            try:
+                win32process.AttachThreadInput(current_thread, foreground_thread, False)
+            except Exception:
+                pass
     
     def get_element_handle_from_label(self,label:int)->uia.Control:
         tree_state=self.desktop_state.tree_state
@@ -359,29 +483,75 @@ class Desktop:
         return no_children or is_name
         
     def get_apps(self) -> list[App]:
+        """
+        Enumerate user-facing top-level windows using Win32 APIs.
+
+        This intentionally avoids UIAutomation enumeration, which can intermittently hang on some providers.
+        """
+        apps: list[App] = []
         try:
-            desktop = uia.GetRootControl()  # Get the desktop control
-            children = desktop.GetChildren()
-            apps = []
-            for depth, child in enumerate(children):
-                if isinstance(child,(uia.WindowControl,uia.PaneControl)):
-                    window_pattern=child.GetPattern(uia.PatternId.WindowPattern)
-                    if (window_pattern is None):
-                        continue
-                    if window_pattern.CanMinimize and window_pattern.CanMaximize:
-                        status = self.get_app_status(child)
-                        size=self.get_app_size(child)
-                        apps.append(App(**{
-                            "name":child.Name,
-                            "depth":depth,
-                            "status":status,
-                            "size":size,
-                            "handle":child.NativeWindowHandle,
-                            "process_id":child.ProcessId
-                        }))
+            def enum_cb(hwnd: int, _lparam):
+                try:
+                    if not hwnd or not win32gui.IsWindow(hwnd):
+                        return True
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return True
+
+                    title = (win32gui.GetWindowText(hwnd) or "").strip()
+                    if not title:
+                        return True
+
+                    # Prefer skipping known noisy system windows by class name.
+                    try:
+                        class_name = win32gui.GetClassName(hwnd)
+                    except Exception:
+                        class_name = ""
+                    from windows_mcp.desktop.config import EXCLUDED_APPS
+                    if class_name in EXCLUDED_APPS:
+                        return True
+
+                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                    if not (style & win32con.WS_MINIMIZEBOX and style & win32con.WS_MAXIMIZEBOX):
+                        return True
+
+                    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                    width, height = max(0, right - left), max(0, bottom - top)
+                    if width * height <= 10:
+                        return True
+
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    is_min = bool(win32gui.IsIconic(hwnd))
+                    if hasattr(win32gui, "IsZoomed"):
+                        is_max = bool(win32gui.IsZoomed(hwnd))  # type: ignore[attr-defined]
+                    else:
+                        try:
+                            show_cmd = win32gui.GetWindowPlacement(hwnd)[1]
+                            is_max = show_cmd == win32con.SW_SHOWMAXIMIZED
+                        except Exception:
+                            is_max = False
+                    is_visible = bool(win32gui.IsWindowVisible(hwnd))
+                    status = (
+                        Status.MINIMIZED if is_min
+                        else Status.MAXIMIZED if is_max
+                        else Status.NORMAL if is_visible
+                        else Status.HIDDEN
+                    )
+                    apps.append(App(
+                        name=title,
+                        depth=len(apps),
+                        status=status,
+                        size=Size(width=width, height=height),
+                        handle=hwnd,
+                        process_id=pid,
+                    ))
+                except Exception:
+                    # Best-effort enumeration: ignore individual window failures.
+                    pass
+                return True
+
+            win32gui.EnumWindows(enum_cb, None)
         except Exception as ex:
             logger.error(f"Error in get_apps: {ex}")
-            apps = []
         return apps
     
     def get_xpath_from_element(self,element:uia.Control):

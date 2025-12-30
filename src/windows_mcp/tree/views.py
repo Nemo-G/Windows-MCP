@@ -1,6 +1,9 @@
 from dataclasses import dataclass,field
 from tabulate import tabulate
 from typing import Optional
+import os
+
+from windows_mcp.tree.config import MAX_INTERACTIVE_ROWS, MAX_SCROLLABLE_ROWS
 
 @dataclass
 class DOMInfo:
@@ -15,13 +18,20 @@ class TreeState:
     scrollable_nodes:list['ScrollElementNode']=field(default_factory=list)
     dom_informative_nodes:list['TextElementNode']=field(default_factory=list)
     dom_info:Optional['DOMInfo']=None
+    # When True, the tree was collected with a hard timeout or other partial failure.
+    is_partial: bool = False
+    warnings: list[str] = field(default_factory=list)
 
     def interactive_elements_to_string(self) -> str:
         if not self.interactive_nodes:
             return "No interactive elements"
         headers = ["Label", "App Name", "ControlType", "Name", "Value", "Shortcut", "Coordinates" ,"IsFocused"]
-        rows = [node.to_row(idx) for idx, node in enumerate(self.interactive_nodes)]
-        return tabulate(rows, headers=headers, tablefmt="simple")
+        shown = self.interactive_nodes[:MAX_INTERACTIVE_ROWS]
+        rows = [node.to_row(idx) for idx, node in enumerate(shown)]
+        table = tabulate(rows, headers=headers, tablefmt="simple")
+        if len(self.interactive_nodes) > len(shown):
+            table += f"\n... showing first {len(shown)} of {len(self.interactive_nodes)} interactive elements ..."
+        return table
 
     def scrollable_elements_to_string(self) -> str:
         if not self.scrollable_nodes:
@@ -31,8 +41,12 @@ class TreeState:
             "Horizontal Scrollable", "Horizontal Scroll Percent(%)", "Vertical Scrollable", "Vertical Scroll Percent(%)", "IsFocused"
         ]
         base_index = len(self.interactive_nodes)
-        rows = [node.to_row(idx, base_index) for idx, node in enumerate(self.scrollable_nodes)]
-        return tabulate(rows, headers=headers, tablefmt="simple")
+        shown = self.scrollable_nodes[:MAX_SCROLLABLE_ROWS]
+        rows = [node.to_row(idx, base_index) for idx, node in enumerate(shown)]
+        table = tabulate(rows, headers=headers, tablefmt="simple")
+        if len(self.scrollable_nodes) > len(shown):
+            table += f"\n... showing first {len(shown)} of {len(self.scrollable_nodes)} scrollable elements ..."
+        return table
     
 @dataclass
 class BoundingBox:
