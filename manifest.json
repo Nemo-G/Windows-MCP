@@ -53,7 +53,7 @@
     },
     {
       "name": "State Tool",
-      "description": "Capture comprehensive desktop state including focused/opened applications, interactive UI elements (buttons, text fields, menus), informative content (text, labels, status), and scrollable areas. Optionally includes visual screenshot when use_vision=True. Essential for understanding current desktop context and available UI interactions."
+      "description": "Capture comprehensive desktop state including focused/opened applications, interactive UI elements (buttons, text fields, menus), informative content (text, labels, status), and scrollable areas. If you need a screenshot, set use_vision=True. To reduce payload size, set resolution=[max_width,max_height] (default: [1920,1080]). Recommended: screenshot_output='path' with screenshot_path as an absolute file path to avoid returning huge binary blobs; use screenshot_output='binary' only if you explicitly need inline image bytes."
     },
     {
       "name": "Click Tool",

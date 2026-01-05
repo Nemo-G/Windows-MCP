@@ -119,7 +119,7 @@ def powershell_tool(command: str, ctx: Context = None) -> str:
 
 @mcp.tool(
     name='State-Tool',
-    description='Captures complete desktop state including: system language, focused/opened apps, interactive elements (buttons, text fields, links, menus with coordinates), and scrollable areas. Set use_vision=True to include screenshot. Set use_dom=True for browser content to get web page elements instead of browser UI. Always call this first to understand the current desktop state before taking actions.',
+    description='Captures complete desktop state including: system language, focused/opened apps, interactive elements (buttons, text fields, links, menus with coordinates), and scrollable areas. Set use_dom=True for browser content to get web page elements instead of browser UI. If you need a screenshot, set use_vision=True. To reduce payload size, you can set resolution=[max_width,max_height] (default: [1920,1080]). Recommended: use screenshot_output="path" with screenshot_path as an absolute file path to avoid returning huge binary blobs; use screenshot_output="binary" only if your client explicitly needs inline image bytes.',
     annotations=ToolAnnotations(
         title="State Tool",
         readOnlyHint=True,
@@ -129,16 +129,58 @@ def powershell_tool(command: str, ctx: Context = None) -> str:
     )
     )
 @with_analytics(analytics, "State-Tool")
-def state_tool(use_vision:bool=False,use_dom:bool=False, ctx: Context = None):
+def state_tool(
+    use_vision:bool=False,
+    use_dom:bool=False,
+    resolution:list[int]|None=None,
+    screenshot_output:Literal["binary","path"]="binary",
+    screenshot_path:str|None=None,
+    ctx: Context = None
+):
     t0 = time.perf_counter()
-    logger.info("State-Tool: begin use_dom=%s use_vision=%s", use_dom, use_vision)
-    # Calculate scale factor to cap resolution at 1080p (1920x1080)
+    logger.info(
+        "State-Tool: begin use_dom=%s use_vision=%s screenshot_output=%s resolution=%s",
+        use_dom,
+        use_vision,
+        screenshot_output,
+        resolution,
+    )
+
+    # Calculate scale factor to cap screenshot resolution (default: 1920x1080).
+    # `resolution` is treated as a max bounding box to preserve aspect ratio.
+    screen_width_now, screen_height_now = desktop.get_resolution()
     max_width, max_height = 1920, 1080
-    scale_width = max_width / screen_width if screen_width > max_width else 1.0
-    scale_height = max_height / screen_height if screen_height > max_height else 1.0
-    scale = min(scale_width, scale_height)  # Use the smaller scale to ensure both dimensions fit
+    if resolution is not None:
+        if len(resolution) != 2:
+            raise ValueError('resolution must be a list of exactly 2 integers: [max_width, max_height]')
+        max_width, max_height = int(resolution[0]), int(resolution[1])
+        if max_width <= 0 or max_height <= 0:
+            raise ValueError('resolution values must be positive integers: [max_width, max_height]')
+
+    scale_width = max_width / screen_width_now if screen_width_now > max_width else 1.0
+    scale_height = max_height / screen_height_now if screen_height_now > max_height else 1.0
+    scale = min(scale_width, scale_height)  # Use smaller scale so both dimensions fit
     
-    desktop_state=desktop.get_state(use_vision=use_vision,use_dom=use_dom,as_bytes=True,scale=scale)
+    if use_vision and screenshot_output == "path":
+        if not screenshot_path:
+            raise ValueError('screenshot_path is required when screenshot_output="path" and use_vision=True')
+        expanded_path = os.path.expandvars(os.path.expanduser(screenshot_path))
+        if not os.path.isabs(expanded_path):
+            raise ValueError('screenshot_path must be an absolute file path when screenshot_output="path"')
+        # Reject trailing separators / directory paths.
+        if expanded_path.endswith(("\\", "/")):
+            raise ValueError('screenshot_path must be a file path (not a directory), e.g. "C:\\\\temp\\\\state.png"')
+        if os.path.isdir(expanded_path):
+            raise ValueError('screenshot_path must be a file path (not an existing directory)')
+        root_dir = os.path.dirname(expanded_path)
+        if not root_dir:
+            raise ValueError('screenshot_path must include a directory, e.g. "C:\\\\temp\\\\state.png"')
+        os.makedirs(root_dir, exist_ok=True)
+        # Default to .png if caller did not specify an extension.
+        if not os.path.splitext(expanded_path)[1]:
+            expanded_path = expanded_path + ".png"
+
+    desktop_state=desktop.get_state(use_vision=use_vision,use_dom=use_dom,as_bytes=use_vision,scale=scale)
     t_state = time.perf_counter()
     interactive_elements=desktop_state.tree_state.interactive_elements_to_string()
     scrollable_elements=desktop_state.tree_state.scrollable_elements_to_string()
@@ -155,6 +197,20 @@ def state_tool(use_vision:bool=False,use_dom:bool=False, ctx: Context = None):
         getattr(desktop_state.tree_state, "is_partial", False),
         len(getattr(desktop_state.tree_state, "warnings", []) or []),
     )
+
+    screenshot_note = ""
+    image_payload: list[Image] = []
+    if use_vision:
+        if screenshot_output == "binary":
+            image_payload = [Image(data=desktop_state.screenshot,format='png')]
+        elif screenshot_output == "path":
+            # `expanded_path` is guaranteed to be defined/validated above in this branch.
+            with open(expanded_path, "wb") as f:
+                f.write(desktop_state.screenshot)
+            screenshot_note = f"\nScreenshot saved to:\n{expanded_path}\n"
+        else:
+            raise ValueError('screenshot_output must be either "binary" or "path"')
+
     return [dedent(f'''
     Default Language of User:
     {default_language} with encoding: {desktop.encoding}
@@ -171,7 +227,8 @@ def state_tool(use_vision:bool=False,use_dom:bool=False, ctx: Context = None):
 
     List of Scrollable Elements:
     {scrollable_elements or 'No scrollable elements found.'}
-    ''')]+([Image(data=desktop_state.screenshot,format='png')] if use_vision else [])
+    {screenshot_note}
+    ''')]+image_payload
 
 @mcp.tool(
     name='Click-Tool',

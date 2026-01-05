@@ -302,6 +302,13 @@ MCP Client can access the following tools to interact with Windows:
 - `Shortcut-Tool`: Press keyboard shortcuts (`Ctrl+c`, `Alt+Tab`, etc).
 - `Wait-Tool`: Pause for a defined duration.
 - `State-Tool`: Combined snapshot of default language, browser, active apps and interactive, textual and scrollable elements along with screenshot of the desktop. Supports `use_dom=True` for browser content extraction (web page elements only) and `use_vision=True` for including screenshots.
+  - Screenshot options (only when `use_vision=True`):
+    - `resolution`: `[max_width, max_height]` (default: `[1920, 1080]`) to reduce payload size while preserving aspect ratio
+    - `screenshot_output`: `"binary"` (default) to return inline image bytes, or `"path"` to save the image to disk and only return the file path
+    - `screenshot_path`: required when `screenshot_output="path"`; must be an absolute file path (example: `C:\temp\state.png`)
+  - Recommended behavior:
+    - Prefer `screenshot_output="path"` + absolute `screenshot_path` to avoid returning huge binary blobs in the tool response.
+    - Set a smaller `resolution` (e.g. `[1280, 720]`) unless you truly need full detail.
 - `App-Tool`: To launch an application from the start menu, resize or move the window and switch between apps.
 - `Shell-Tool`: To execute PowerShell commands.
 - `Scrape-Tool`: To scrape the entire webpage for information.
